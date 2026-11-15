@@ -13,8 +13,252 @@ import {
   RotateCcw,
   ChevronLeft,
   ChevronRight,
-  Plane
+  Plane,
+  Activity
 } from 'lucide-react';
+import {
+  AIRPORTS,
+  type AirportCode,
+  type FlightRecord,
+  type WakeCategory,
+} from './physics/wakeEngine';
+
+function isWakeCategory(value: unknown): value is WakeCategory {
+  return value === 'SUPER' || value === 'HEAVY' || value === 'MEDIUM';
+}
+
+function isAirportFlight(value: unknown): value is FlightRecord {
+  if (typeof value !== 'object' || value === null) return false;
+  const flight = value as Record<string, unknown>;
+  return (
+    typeof flight.callsign === 'string' &&
+    flight.callsign.length > 0 &&
+    typeof flight.acType === 'string' &&
+    flight.acType.length > 0 &&
+    isWakeCategory(flight.wakeClass) &&
+    (flight.opType === 'ARR' || flight.opType === 'DEP') &&
+    typeof flight.runway === 'string' &&
+    Number.isFinite(flight.arrivalMinutes) &&
+    Number.isFinite(flight.speedKts) &&
+    Number.isFinite(flight.icaoSepNm)
+  );
+}
+
+interface LiveAircraftPosition {
+  icao24: string;
+  callsign: string | null;
+  hasPosition: boolean;
+  latitude: number;
+  longitude: number;
+  onGround: boolean;
+  groundspeedKt: number | null;
+  headingDeg: number | null;
+  baroAltitudeFt: number | null;
+  verticalRateFpm: number | null;
+  squawk: string | null;
+}
+
+interface AircraftPositionHistory {
+  onGround: boolean;
+  groundspeedKt: number | null;
+  seenAt: number;
+}
+
+const SFO_CENTER = { latitude: 37.6213, longitude: -122.3790 };
+const SFO_MAP_UNITS_PER_NM = 760;
+const SFO_RUNWAYS = [
+  {
+    id: '28R',
+    heading: 284,
+    endpoints: [[37.6285, -122.3932], [37.6135, -122.3575]],
+    mapEndpoints: [[-760, -115], [720, -115]],
+    mapHeading: 270,
+  },
+  {
+    id: '28L',
+    heading: 284,
+    endpoints: [[37.6263, -122.3939], [37.6115, -122.3585]],
+    mapEndpoints: [[-730, -25], [690, -25]],
+    mapHeading: 270,
+  },
+  {
+    id: '01L',
+    heading: 10,
+    endpoints: [[37.6118, -122.3832], [37.6295, -122.3712]],
+    mapEndpoints: [[120, 380], [120, -540]],
+    mapHeading: 0,
+  },
+  {
+    id: '01R',
+    heading: 10,
+    endpoints: [[37.6110, -122.3806], [37.6315, -122.3668]],
+    mapEndpoints: [[210, 450], [210, -580]],
+    mapHeading: 0,
+  },
+] as const;
+const SFO_MAP_RUNWAYS = [
+  { left: -760, right: 720, top: -132, bottom: -98 },
+  { left: -730, right: 690, top: -42, bottom: -8 },
+  { left: 104, right: 136, top: -540, bottom: 380 },
+  { left: 194, right: 226, top: -580, bottom: 450 },
+] as const;
+const SFO_APRON_ZONES = [
+  {
+    name: 'TERMINAL',
+    points: [[-635, 95], [45, 95], [45, 415], [-390, 445], [-595, 365], [-635, 220]],
+  },
+  {
+    name: 'NORTH FIELD PARKING',
+    points: [[-515, -415], [-200, -415], [-200, -240], [-515, -240]],
+  },
+  {
+    name: 'CARGO PARKING',
+    points: [[-710, -320], [-545, -320], [-545, -190], [-710, -190]],
+  },
+  {
+    name: 'SOUTHFIELD PARKING',
+    points: [[335, 115], [630, 115], [630, 280], [335, 280]],
+  },
+] as const;
+
+function isNullableFiniteNumber(value: unknown): value is number | null {
+  return value === null || (typeof value === 'number' && Number.isFinite(value));
+}
+
+function isLiveAircraftPosition(value: unknown): value is LiveAircraftPosition {
+  if (typeof value !== 'object' || value === null) return false;
+  const aircraft = value as Record<string, unknown>;
+  return (
+    typeof aircraft.icao24 === 'string' &&
+    typeof aircraft.hasPosition === 'boolean' &&
+    aircraft.hasPosition &&
+    typeof aircraft.onGround === 'boolean' &&
+    isNullableFiniteNumber(aircraft.latitude) &&
+    typeof aircraft.latitude === 'number' &&
+    isNullableFiniteNumber(aircraft.longitude) &&
+    typeof aircraft.longitude === 'number' &&
+    isNullableFiniteNumber(aircraft.groundspeedKt) &&
+    isNullableFiniteNumber(aircraft.headingDeg) &&
+    isNullableFiniteNumber(aircraft.baroAltitudeFt) &&
+    isNullableFiniteNumber(aircraft.verticalRateFpm) &&
+    (aircraft.callsign === null || typeof aircraft.callsign === 'string') &&
+    (aircraft.squawk === null || typeof aircraft.squawk === 'string')
+  );
+}
+
+function toSfoLocalNm(latitude: number, longitude: number) {
+  return {
+    x: (longitude - SFO_CENTER.longitude) * 60 * Math.cos((SFO_CENTER.latitude * Math.PI) / 180),
+    y: (latitude - SFO_CENTER.latitude) * 60,
+  };
+}
+
+function projectOntoSegmentNm(
+  point: { x: number; y: number },
+  start: readonly [number, number],
+  end: readonly [number, number]
+) {
+  const a = toSfoLocalNm(start[0], start[1]);
+  const b = toSfoLocalNm(end[0], end[1]);
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const progress = Math.max(
+    0,
+    Math.min(1, ((point.x - a.x) * dx + (point.y - a.y) * dy) / (dx * dx + dy * dy))
+  );
+  return {
+    progress,
+    distanceNm: Math.hypot(point.x - (a.x + progress * dx), point.y - (a.y + progress * dy)),
+  };
+}
+
+function headingMatchesRunway(heading: number | null, runwayHeading: number) {
+  if (heading === null) return false;
+  const difference = (target: number) => Math.abs((((heading - target) % 360) + 540) % 360 - 180);
+  return Math.min(difference(runwayHeading), difference((runwayHeading + 180) % 360) ) <= 30;
+}
+
+function getNearestSfoRunway(latitude: number, longitude: number, heading: number | null) {
+  const point = toSfoLocalNm(latitude, longitude);
+  let nearest: (typeof SFO_RUNWAYS)[number] & { distanceNm: number; progress: number } | null = null;
+  for (const runway of SFO_RUNWAYS) {
+    const projection = projectOntoSegmentNm(point, runway.endpoints[0], runway.endpoints[1]);
+    const isAligned = headingMatchesRunway(heading, runway.heading);
+    const nearestIsAligned = nearest !== null && headingMatchesRunway(heading, nearest.heading);
+    if (
+      !nearest ||
+      projection.distanceNm < nearest.distanceNm - 0.01 ||
+      (Math.abs(projection.distanceNm - nearest.distanceNm) <= 0.01 && isAligned && !nearestIsAligned)
+    ) {
+      nearest = { ...runway, ...projection };
+    }
+  }
+  if (!nearest) throw new Error('No SFO runway geometry is configured.');
+  return nearest;
+}
+
+function getDirectionalRunwayId(runway: { id: string; heading: number }, heading: number | null) {
+  const reciprocalIds: Record<string, string> = {
+    '28R': '10L',
+    '28L': '10R',
+    '01L': '19R',
+    '01R': '19L',
+  };
+  if (heading === null) return runway.id;
+  const difference = Math.abs((((heading - runway.heading) % 360) + 540) % 360 - 180);
+  return difference <= 90 ? runway.id : reciprocalIds[runway.id] ?? runway.id;
+}
+
+function getDirectionalSfoMapHeading(
+  runway: { heading: number; mapHeading: number },
+  heading: number | null
+) {
+  if (heading === null) return runway.mapHeading;
+  const difference = Math.abs((((heading - runway.heading) % 360) + 540) % 360 - 180);
+  return difference <= 90 ? runway.mapHeading : (runway.mapHeading + 180) % 360;
+}
+
+function toSfoMapPosition(latitude: number, longitude: number) {
+  const local = toSfoLocalNm(latitude, longitude);
+  return {
+    x: -151 + local.x * SFO_MAP_UNITS_PER_NM,
+    y: -129 - local.y * SFO_MAP_UNITS_PER_NM,
+  };
+}
+
+function toSfoRunwayMapPosition(runway: (typeof SFO_RUNWAYS)[number] & { progress: number }) {
+  const [start, end] = runway.mapEndpoints;
+  return {
+    x: start[0] + runway.progress * (end[0] - start[0]),
+    y: start[1] + runway.progress * (end[1] - start[1]),
+  };
+}
+
+function isPointInPolygon(x: number, y: number, polygon: readonly (readonly [number, number])[]) {
+  let inside = false;
+  for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index, index += 1) {
+    const [currentX, currentY] = polygon[index];
+    const [previousX, previousY] = polygon[previous];
+    if (
+      (currentY > y) !== (previousY > y) &&
+      x < ((previousX - currentX) * (y - currentY)) / (previousY - currentY) + currentX
+    ) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function getSfoApronZone(x: number, y: number) {
+  return SFO_APRON_ZONES.find((zone) => isPointInPolygon(x, y, zone.points))?.name ?? null;
+}
+
+function isOnSfoMapRunway(x: number, y: number) {
+  // The schematic map's runway layout differs from the geodetic runway geometry.
+  return SFO_MAP_RUNWAYS.some(
+    (runway) => x >= runway.left && x <= runway.right && y >= runway.top && y <= runway.bottom
+  );
+}
 
 // Initial authentic KSFO surface & terminal airspace traffic aligned to KSFO schematics
 const INITIAL_AIRCRAFT = [
@@ -155,6 +399,10 @@ const INITIAL_AIRCRAFT = [
     state: 'parked'
   }
 ];
+export type SurfaceAircraft = (typeof INITIAL_AIRCRAFT)[number] & {
+  flight: FlightRecord;
+  isRealData?: boolean;
+};
 
 // Color palettes for authentic FAA ASDE-X Day Scope vs Night Radar Scope
 const SCOPE_THEMES = {
@@ -226,9 +474,23 @@ const SCOPE_THEMES = {
   }
 };
 
-export default function App() {
+interface KsfoRadarProps {
+  airport: AirportCode;
+  metar: string;
+  onAirportChange: (airport: AirportCode) => void;
+  onVisualizeTurbulence: (aircraft: SurfaceAircraft) => void;
+}
+
+export default function App({
+  airport,
+  metar,
+  onAirportChange,
+  onVisualizeTurbulence,
+}: KsfoRadarProps) {
   const canvasRef = useRef(null);
-  const aircraftRef = useRef(INITIAL_AIRCRAFT.map(a => ({ ...a })));
+  const aircraftRef = useRef<SurfaceAircraft[]>([]);
+  const liveAircraftHistoryRef = useRef(new Map<string, AircraftPositionHistory>());
+  const activeTakeoffRef = useRef(new Map<string, number>());
 
   // UI & Viewport states
   const [scopeMode, setScopeMode] = useState('day'); // 'day' matches the circled tower monitor
@@ -241,10 +503,10 @@ export default function App() {
   const [isDragging, setIsDragging] = useState(false);
   const dragStartRef = useRef({ x: 0, y: 0, panX: 0, panY: 0, moved: false });
 
-  const [selectedId, setSelectedId] = useState('UA-863');
-  const [aircraftList, setAircraftList] = useState(INITIAL_AIRCRAFT);
-  const [wind] = useState({ dir: 280, speed: 15, gust: 24 });
-  const [altimeter] = useState(30.12);
+  const [selectedId, setSelectedId] = useState('');
+  const [aircraftList, setAircraftList] = useState<SurfaceAircraft[]>([]);
+  const [feedStatus, setFeedStatus] = useState('SYNCING...');
+  const [realDataMode, setRealDataMode] = useState(false);
   const [utcTime, setUtcTime] = useState('');
 
   // Keep latest reactive settings in refs for smooth 60fps Canvas loop
@@ -255,7 +517,8 @@ export default function App() {
     selectedId,
     showInsets,
     hideUI,
-    panelCollapsed
+    panelCollapsed,
+    realDataMode
   });
 
   useEffect(() => {
@@ -266,9 +529,10 @@ export default function App() {
       selectedId,
       showInsets,
       hideUI,
-      panelCollapsed
+      panelCollapsed,
+      realDataMode
     };
-  }, [scopeMode, zoom, pan, selectedId, showInsets, hideUI, panelCollapsed]);
+  }, [scopeMode, zoom, pan, selectedId, showInsets, hideUI, panelCollapsed, realDataMode]);
 
   // Live Zulu (UTC) clock for ATCT display
   useEffect(() => {
@@ -291,6 +555,221 @@ export default function App() {
     }, 250);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    let controller: AbortController | undefined;
+
+    aircraftRef.current = [];
+    setAircraftList([]);
+    setSelectedId('');
+    setFeedStatus(realDataMode ? 'SYNCING REAL POSITIONS...' : 'SYNCING...');
+    liveAircraftHistoryRef.current.clear();
+    activeTakeoffRef.current.clear();
+
+    if (realDataMode && airport !== 'KSFO') {
+      setFeedStatus('REAL DATA AVAILABLE FOR KSFO ONLY');
+      return () => {
+        active = false;
+      };
+    }
+
+    const syncAirportFlights = async () => {
+      controller?.abort();
+      controller = new AbortController();
+
+      try {
+        const response = await fetch(
+          `http://localhost:3001/api/live-flights?airport=${airport}`,
+          { signal: controller.signal }
+        );
+        if (!response.ok) throw new Error(`Live flight API returned HTTP ${response.status}`);
+        const data: unknown = await response.json();
+        if (
+          typeof data !== 'object' ||
+          data === null ||
+          !('flights' in data) ||
+          !Array.isArray(data.flights) ||
+          !('aircraft' in data) ||
+          !Array.isArray(data.aircraft)
+        ) {
+          throw new Error('Live flight API returned an invalid response.');
+        }
+
+        const liveFlights = data.flights.filter(isAirportFlight);
+        let nextAircraft: SurfaceAircraft[];
+
+        if (realDataMode) {
+          const now = Date.now();
+          const nextHistory = new Map<string, AircraftPositionHistory>();
+          const nextTakeoffs = new Map(activeTakeoffRef.current);
+          const realTargets = data.aircraft.filter(isLiveAircraftPosition).flatMap((source, index) => {
+            const localPosition = toSfoLocalNm(source.latitude, source.longitude);
+            const distanceFromAirportNm = Math.hypot(localPosition.x, localPosition.y);
+            if (distanceFromAirportNm > 2.5) return [];
+
+            const previous = liveAircraftHistoryRef.current.get(source.icao24);
+            const hasRecentHistory = previous !== undefined && now - previous.seenAt <= 5 * 60_000;
+            const speed = source.groundspeedKt ?? 0;
+            const nearestRunway = getNearestSfoRunway(
+              source.latitude,
+              source.longitude,
+              source.headingDeg
+            );
+            const onGeographicRunway = nearestRunway.distanceNm <= 0.05;
+            const runwayAligned = headingMatchesRunway(source.headingDeg, nearestRunway.heading);
+            const directionalRunway = getDirectionalRunwayId(nearestRunway, source.headingDeg);
+            const acceleratingForTakeoff =
+              source.onGround &&
+              onGeographicRunway &&
+              runwayAligned &&
+              speed >= 35 &&
+              hasRecentHistory &&
+              previous.onGround &&
+              previous.groundspeedKt !== null &&
+              speed - previous.groundspeedKt >= 5;
+            const liftingOff =
+              !source.onGround &&
+              hasRecentHistory &&
+              previous.onGround &&
+              nearestRunway.distanceNm <= 0.35 &&
+              runwayAligned &&
+              speed >= 45 &&
+              (source.baroAltitudeFt ?? Infinity) <= 600 &&
+              (source.verticalRateFpm ?? 0) >= 200;
+
+            if (acceleratingForTakeoff || liftingOff) {
+              nextTakeoffs.set(source.icao24, now + 3 * 60_000);
+            }
+            const climbingAfterTakeoff =
+              !source.onGround &&
+              (nextTakeoffs.get(source.icao24) ?? 0) > now &&
+              nearestRunway.distanceNm <= 1.5 &&
+              runwayAligned &&
+              speed >= 45 &&
+              (source.baroAltitudeFt ?? Infinity) <= 800 &&
+              (source.verticalRateFpm ?? 0) >= 200;
+            const rawMapPosition = toSfoMapPosition(source.latitude, source.longitude);
+            const mapPosition = acceleratingForTakeoff
+              ? toSfoRunwayMapPosition(nearestRunway)
+              : rawMapPosition;
+            const onDisplayedRunway = isOnSfoMapRunway(mapPosition.x, mapPosition.y);
+            const taxiing =
+              source.onGround &&
+              !onDisplayedRunway &&
+              speed >= 3 &&
+              speed <= 32;
+            const apronZone = getSfoApronZone(mapPosition.x, mapPosition.y);
+            const parked =
+              source.onGround &&
+              source.groundspeedKt !== null &&
+              speed < 3 &&
+              !onDisplayedRunway &&
+              apronZone !== null;
+
+            nextHistory.set(source.icao24, {
+              onGround: source.onGround,
+              groundspeedKt: source.groundspeedKt,
+              seenAt: now,
+            });
+            if (!taxiing && !parked && !acceleratingForTakeoff && !liftingOff && !climbingAfterTakeoff) return [];
+
+            const callsign = source.callsign?.trim() || source.icao24.toUpperCase();
+            const aircraftType = 'UNKN';
+            const runway = (acceleratingForTakeoff || liftingOff || climbingAfterTakeoff)
+              ? directionalRunway
+              : '—';
+            const state = taxiing ? 'taxiing' : parked ? 'parked' : 'takeoff';
+            const status = taxiing
+              ? 'TAXIING · LIVE'
+              : parked
+                ? `PARKED · ${apronZone}`
+                : source.onGround
+                  ? `TAKEOFF ROLL RWY ${runway}`
+                  : `TAKEOFF CLIMB RWY ${runway}`;
+            const profile = INITIAL_AIRCRAFT[index % INITIAL_AIRCRAFT.length];
+            const flightRecord: FlightRecord = {
+              callsign,
+              acType: aircraftType,
+              wakeClass: 'MEDIUM',
+              opType: 'DEP',
+              runway: runway === '—' ? AIRPORTS.KSFO.runway : runway,
+              arrivalMinutes: 1,
+              speedKts: speed,
+              icaoSepNm: 3,
+            };
+
+            return [{
+              ...profile,
+              id: source.icao24,
+              callsign,
+              type: aircraftType,
+              airline: 'UNKNOWN',
+              x: mapPosition.x,
+              y: mapPosition.y,
+              heading: acceleratingForTakeoff
+                ? getDirectionalSfoMapHeading(nearestRunway, source.headingDeg)
+                : source.headingDeg ?? 0,
+              speed,
+              altitude: source.baroAltitudeFt ?? 0,
+              status,
+              route: 'OPEN SKY · LIVE POSITION',
+              assignedRwy: runway,
+              squawk: source.squawk ?? '----',
+              dest: '—',
+              state,
+              flight: flightRecord,
+              isRealData: true,
+            }];
+          });
+          liveAircraftHistoryRef.current = nextHistory;
+          for (const [icao24, expiresAt] of nextTakeoffs) {
+            if (expiresAt <= now) nextTakeoffs.delete(icao24);
+          }
+          activeTakeoffRef.current = nextTakeoffs;
+          nextAircraft = realTargets;
+        } else {
+          nextAircraft = liveFlights.slice(0, INITIAL_AIRCRAFT.length).map((flight, index) => ({
+            ...INITIAL_AIRCRAFT[index],
+            callsign: flight.callsign,
+            type: flight.acType,
+            assignedRwy: flight.runway,
+            speed: flight.speedKts,
+            flight,
+          }));
+        }
+
+        if (!active) return;
+        aircraftRef.current = nextAircraft;
+        setAircraftList(nextAircraft);
+        setSelectedId((current) =>
+          nextAircraft.some((aircraft) => aircraft.id === current)
+            ? current
+            : nextAircraft[0]?.id ?? ''
+        );
+        setFeedStatus(
+          realDataMode
+            ? nextAircraft.length > 0 ? 'LIVE POSITIONS' : 'NO SURFACE TRAFFIC'
+            : nextAircraft.length > 0 ? 'LIVE CALLSIGNS' : 'NO LIVE AIRCRAFT'
+        );
+      } catch (error) {
+        if (!active || (error instanceof DOMException && error.name === 'AbortError')) return;
+        console.error('Airport flight request failed', error);
+        aircraftRef.current = [];
+        setAircraftList([]);
+        setSelectedId('');
+        setFeedStatus('LIVE FEED UNAVAILABLE');
+      }
+    };
+
+    void syncAirportFlights();
+    const interval = setInterval(syncAirportFlights, 30_000);
+    return () => {
+      active = false;
+      controller?.abort();
+      clearInterval(interval);
+    };
+  }, [airport, realDataMode]);
 
   // Helper: Draw a directional swept-wing aircraft icon at (x, y) rotated to heading
   const drawAircraftSymbol = useCallback((ctx, x, y, heading, fill, stroke, scaleFactor = 1) => {
@@ -975,6 +1454,8 @@ export default function App() {
 
       // 1. Update Runway-Aligned Aircraft Physics
       aircraftRef.current = aircraftRef.current.map(ac => {
+        if (ac.isRealData) return ac;
+
         let { x, y, heading, speed, altitude, status, state } = ac;
         const rad = (heading * Math.PI) / 180;
         const dirX = Math.sin(rad);
@@ -1308,7 +1789,7 @@ export default function App() {
               </div>
               <div>
                 <h1 className="font-black text-sm tracking-wider text-emerald-400">
-                  KSFO ATCT TOWER
+                  {airport} ATCT TOWER
                 </h1>
                 <p className="text-[11px] text-slate-400">
                   ASDE-X Surface Movement Radar
@@ -1316,6 +1797,20 @@ export default function App() {
               </div>
             </div>
             <div className="flex items-center gap-1.5">
+              <select
+                aria-label="Surface radar airport"
+                value={airport}
+                onChange={(event) => {
+                  const nextAirport = event.target.value as AirportCode;
+                  if (nextAirport !== 'KSFO') setRealDataMode(false);
+                  onAirportChange(nextAirport);
+                }}
+                className="bg-slate-900 text-emerald-300 text-[11px] font-mono font-bold px-2 py-1 rounded border border-slate-700"
+              >
+                {(Object.keys(AIRPORTS) as AirportCode[]).map((code) => (
+                  <option key={code} value={code}>{code} ({AIRPORTS[code].iata})</option>
+                ))}
+              </select>
               <span className="text-[11px] bg-emerald-950 text-emerald-400 px-2.5 py-1 rounded border border-emerald-800 font-bold">
                 {utcTime || 'ONLINE'}
               </span>
@@ -1333,18 +1828,36 @@ export default function App() {
           <div className="mt-3.5 p-3.5 bg-slate-900/90 border border-slate-800 rounded-xl space-y-1.5">
             <div className="flex justify-between items-center text-emerald-400 font-bold text-xs">
               <span className="flex items-center gap-1.5">
-                <Wind size={15} /> METAR KSFO
+                <Wind size={15} /> METAR {airport}
               </span>
-              <span>QNH {altimeter.toFixed(2)} INHG</span>
             </div>
-            <p className="text-xs text-slate-200 font-bold tracking-tight">
-              KSFO 150056Z {wind.dir}
-              {wind.speed}G{wind.gust}KT 10SM FEW020 18/12 A{Math.round(altimeter * 100)}
-            </p>
+            <p className="text-xs text-slate-200 font-bold tracking-tight">{metar}</p>
             <div className="pt-1 flex items-center justify-between text-[11px] text-amber-300 font-bold border-t border-slate-800/80">
-              <span>WEST PLAN OPS</span>
-              <span>ARR 28L/28R • DEP 01L/01R</span>
+              <span>ACTIVE RUNWAY</span>
+              <span>{AIRPORTS[airport].runway}</span>
             </div>
+          </div>
+
+          <div className="mt-3 p-3 bg-slate-900/80 border border-slate-800 rounded-xl">
+            <button
+              type="button"
+              aria-pressed={realDataMode}
+              disabled={airport !== 'KSFO'}
+              onClick={() => setRealDataMode((enabled) => !enabled)}
+              className={`w-full py-2.5 rounded-lg border text-xs font-bold transition flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-50 ${
+                realDataMode
+                  ? 'bg-emerald-950 border-emerald-600 text-emerald-200'
+                  : 'bg-slate-800 hover:bg-slate-700 border-slate-600 text-slate-100'
+              }`}
+            >
+              <Activity size={15} />
+              {realDataMode ? 'RETURN TO SIMULATION' : 'VISUALIZE REAL DATA'}
+            </button>
+            <p className="mt-1.5 text-[10px] text-slate-400 text-center">
+              {airport === 'KSFO'
+                ? 'Actual SFO positions · taxiing and confirmed takeoffs'
+                : 'Real position view is available for KSFO only'}
+            </p>
           </div>
 
           {/* Active Flights & Surface Targets List */}
@@ -1354,11 +1867,24 @@ export default function App() {
                 ACTIVE SURFACE & FINAL TARGETS
               </span>
               <span className="text-[11px] bg-amber-950/80 text-amber-300 px-2 py-0.5 rounded border border-amber-800/80 font-bold">
-                {aircraftList.length} TRACKS
+                {feedStatus} · {aircraftList.length} TRACKS
               </span>
             </div>
 
             <div className="flex-1 overflow-y-auto space-y-2 pr-1">
+              {aircraftList.length === 0 && (
+                <p className="p-3 text-xs text-slate-400">
+                  {feedStatus === 'NO SURFACE TRAFFIC'
+                    ? 'No nearby aircraft are taxiing, parked on an apron, or showing confirmed takeoff activity.'
+                    : feedStatus === 'REAL DATA AVAILABLE FOR KSFO ONLY'
+                      ? 'Select KSFO to visualize actual surface positions.'
+                      : feedStatus === 'NO LIVE AIRCRAFT'
+                    ? `No live aircraft are currently available for ${airport}.`
+                    : feedStatus === 'LIVE FEED UNAVAILABLE'
+                      ? `Unable to load live aircraft for ${airport}.`
+                      : `Loading live aircraft for ${airport}...`}
+                </p>
+              )}
               {aircraftList.map(ac => {
                 const isSel = ac.id === selectedId;
                 return (
@@ -1397,49 +1923,61 @@ export default function App() {
             <div className="mt-3 p-3.5 bg-slate-900 border border-amber-500/80 rounded-xl space-y-2.5 shadow-xl">
               <div className="flex justify-between items-center">
                 <span className="text-xs font-black text-amber-400">
-                  {selectedAircraft.callsign} ({selectedAircraft.assignedRwy}) CLEARANCE
+                  {selectedAircraft.isRealData
+                    ? `${selectedAircraft.callsign} · LIVE TRACK`
+                    : `${selectedAircraft.callsign} (${selectedAircraft.assignedRwy}) CLEARANCE`}
                 </span>
                 <button
-                  onClick={() => setSelectedId(null)}
+                  onClick={() => setSelectedId('')}
                   className="text-[10px] text-slate-300 hover:text-white font-bold px-2 py-0.5 bg-slate-800 rounded"
                 >
                   DESELECT
                 </button>
               </div>
               <div className="grid grid-cols-2 gap-2">
-                <button
-                  onClick={() => issueClearance('TAKEOFF')}
-                  className="py-2 bg-emerald-950 hover:bg-emerald-900 border border-emerald-700 text-emerald-200 rounded-lg text-xs font-bold transition"
-                >
-                  CLEARED TAKEOFF
-                </button>
-                <button
-                  onClick={() => issueClearance('LINEUP')}
-                  className="py-2 bg-sky-950 hover:bg-sky-900 border border-sky-700 text-sky-200 rounded-lg text-xs font-bold transition"
-                >
-                  LINE UP & WAIT
-                </button>
-                <button
-                  onClick={() => issueClearance('HOLD')}
-                  className="py-2 bg-amber-950 hover:bg-amber-900 border border-amber-700 text-amber-200 rounded-lg text-xs font-bold transition"
-                >
-                  HOLD SHORT
-                </button>
-                <button
-                  onClick={() =>
-                    issueClearance(
-                      selectedAircraft.state === 'landing' || selectedAircraft.state === 'rollout'
-                        ? 'GOAROUND'
-                        : 'TAXI'
-                    )
-                  }
-                  className="py-2 bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 rounded-lg text-xs font-bold transition"
-                >
-                  {selectedAircraft.state === 'landing' || selectedAircraft.state === 'rollout'
-                    ? 'GO AROUND'
-                    : 'TAXI TWY B'}
-                </button>
+                {!realDataMode && (
+                  <>
+                    <button
+                      onClick={() => issueClearance('TAKEOFF')}
+                      className="py-2 bg-emerald-950 hover:bg-emerald-900 border border-emerald-700 text-emerald-200 rounded-lg text-xs font-bold transition"
+                    >
+                      CLEARED TAKEOFF
+                    </button>
+                    <button
+                      onClick={() => issueClearance('LINEUP')}
+                      className="py-2 bg-sky-950 hover:bg-sky-900 border border-sky-700 text-sky-200 rounded-lg text-xs font-bold transition"
+                    >
+                      LINE UP & WAIT
+                    </button>
+                    <button
+                      onClick={() => issueClearance('HOLD')}
+                      className="py-2 bg-amber-950 hover:bg-amber-900 border border-amber-700 text-amber-200 rounded-lg text-xs font-bold transition"
+                    >
+                      HOLD SHORT
+                    </button>
+                    <button
+                      onClick={() =>
+                        issueClearance(
+                          selectedAircraft.state === 'landing' || selectedAircraft.state === 'rollout'
+                            ? 'GOAROUND'
+                            : 'TAXI'
+                        )
+                      }
+                      className="py-2 bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 rounded-lg text-xs font-bold transition"
+                    >
+                      {selectedAircraft.state === 'landing' || selectedAircraft.state === 'rollout'
+                        ? 'GO AROUND'
+                        : 'TAXI TWY B'}
+                    </button>
+                  </>
+                )}
               </div>
+              <button
+                onClick={() => onVisualizeTurbulence(selectedAircraft)}
+                className="w-full py-2 bg-cyan-950 hover:bg-cyan-900 border border-cyan-700 text-cyan-200 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5"
+              >
+                <Wind size={14} /> VISUALIZE TURBULENCE
+              </button>
             </div>
           )}
 

@@ -446,10 +446,11 @@ function AnimatedAirspace({
 
   const leadFlight = flights.find((f) => f.callsign === params.leadFlightId) || flights[0];
   const followingFlight = flights.find((f) => f.callsign === params.followingFlightId) || flights[1];
+  const visibleFlights = [leadFlight];
 
   const leadPos = useMemo(() => {
     const base = getFlightState3D(leadFlight, airportSpec.runway);
-    return [base.x, base.y, base.z - simTick] as [number, number, number];
+    return [0, base.y, base.z - simTick] as [number, number, number];
   }, [leadFlight, airportSpec.runway, simTick]);
 
   const wakeTrailLength = Math.min(5.2, Math.max(2.8, telemetry.separationNm * 1.1));
@@ -490,7 +491,7 @@ function AnimatedAirspace({
 
   return (
     <group>
-      {flights.map((flight) => {
+      {visibleFlights.map((flight) => {
         const base = getFlightState3D(flight, airportSpec.runway);
         const isLead = flight.callsign === leadFlight.callsign;
         const isFollowing = flight.callsign === followingFlight.callsign;
@@ -500,7 +501,7 @@ function AnimatedAirspace({
         const offsetY = isFollowing ? recommendedOffset.altitudeFt / 220 : 0;
 
         const pos: [number, number, number] = [
-          base.x + offsetX,
+          isLead ? 0 : base.x + offsetX,
           base.y + offsetY,
           base.z - simTick,
         ];

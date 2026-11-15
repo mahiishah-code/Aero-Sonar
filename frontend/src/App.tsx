@@ -1,5 +1,5 @@
 import AtcRadar from "./AtcRadar";
-import KsfoRadar from "./KsfoRadar";
+import KsfoRadar, { type SurfaceAircraft } from "./KsfoRadar";
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { Wind, ShieldAlert, Cpu, Sparkles, Plane, Leaf, DollarSign, WifiOff, Play, Pause, Volume2, VolumeX, RotateCcw, Radio, Sun, Moon, Maximize2, Minimize2, Activity } from 'lucide-react';
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts';
@@ -25,10 +25,27 @@ interface WeatherObservation {
   fltCat: string | null;
 }
 
+function getSurfaceDemoLeadFlight(callsign: string): FlightRecord {
+  return { ...INITIAL_FLIGHTS[0], callsign };
+}
+
+function getSurfaceDemoFlights(callsign: string | null): FlightRecord[] {
+  if (!callsign) return INITIAL_FLIGHTS;
+
+  const leadFlight = getSurfaceDemoLeadFlight(callsign);
+  return [
+    leadFlight,
+    ...INITIAL_FLIGHTS.filter(
+      (flight) => flight.callsign !== INITIAL_FLIGHTS[0].callsign && flight.callsign !== callsign
+    ),
+  ];
+}
+
 export default function App() {
   const [activeScreen, setActiveScreen] = useState<"DEMO" | "ATC" | "KSFO">("DEMO");
   const [activeView, setActiveView] = useState<"DEMO" | "ATC_RADAR" | "KSFO_RADAR">("DEMO");
   const [flights, setFlights] = useState<FlightRecord[]>(INITIAL_FLIGHTS);
+  const [selectedSurfaceCallsign, setSelectedSurfaceCallsign] = useState<string | null>(null);
   const [lightMode, setLightMode] = useState(false);
   const [focusTrigger, setFocusTrigger] = useState(0);
   const [feedMode, setFeedMode] = useState<'SIM' | 'REALTIME'>('SIM');
@@ -136,7 +153,23 @@ export default function App() {
 
   useEffect(() => {
     if (feedMode !== 'REALTIME') {
-      setFlights(INITIAL_FLIGHTS);
+      const simulationFlights = getSurfaceDemoFlights(selectedSurfaceCallsign);
+      setFlights(simulationFlights);
+      if (selectedSurfaceCallsign) {
+        setParams((current) => ({
+          ...current,
+          leadFlightId: selectedSurfaceCallsign,
+          followingFlightId:
+            simulationFlights.some(
+              (flight) =>
+                flight.callsign === current.followingFlightId &&
+                flight.callsign !== selectedSurfaceCallsign
+            )
+              ? current.followingFlightId
+              : simulationFlights.find((flight) => flight.callsign !== selectedSurfaceCallsign)?.callsign
+                ?? simulationFlights[0].callsign,
+        }));
+      }
       setRealtimeStatus('SYNCING');
       return;
     }
@@ -148,18 +181,28 @@ export default function App() {
         const data = await res.json();
         if (Array.isArray(data.flights) && data.flights.length >= 2) {
           const liveFlights = data.flights as FlightRecord[];
-          setFlights(liveFlights);
+          const surfaceLeadFlight = selectedSurfaceCallsign
+            ? getSurfaceDemoLeadFlight(selectedSurfaceCallsign)
+            : null;
+          const availableFlights = surfaceLeadFlight
+            ? [
+                surfaceLeadFlight,
+                ...liveFlights.filter((flight) => flight.callsign !== surfaceLeadFlight.callsign),
+              ]
+            : liveFlights;
+          setFlights(availableFlights);
           setParams((current) => {
-            const callsigns = new Set(liveFlights.map((flight) => flight.callsign));
-            const leadFlightId = callsigns.has(current.leadFlightId)
+            const callsigns = new Set(availableFlights.map((flight) => flight.callsign));
+            const leadFlightId = surfaceLeadFlight
+              ? surfaceLeadFlight.callsign
+              : callsigns.has(current.leadFlightId)
               ? current.leadFlightId
-              : liveFlights[0].callsign;
+              : availableFlights[0].callsign;
             const followingFlightId =
               callsigns.has(current.followingFlightId) && current.followingFlightId !== leadFlightId
                 ? current.followingFlightId
-                : liveFlights[0].callsign === leadFlightId
-                  ? liveFlights[1].callsign
-                  : liveFlights[0].callsign;
+                : availableFlights.find((flight) => flight.callsign !== leadFlightId)?.callsign
+                  ?? availableFlights[0].callsign;
             return { ...current, leadFlightId, followingFlightId };
           });
           if (typeof data.crosswind_kts === 'number') {
@@ -168,19 +211,25 @@ export default function App() {
           setRealtimeStatus('BACKEND LIVE (DEMO VALUES)');
           return;
         }
-        setFlights(INITIAL_FLIGHTS);
+        const fallbackFlights = getSurfaceDemoFlights(selectedSurfaceCallsign);
+        setFlights(fallbackFlights);
         setParams((current) => ({
           ...current,
-          leadFlightId: INITIAL_FLIGHTS[0].callsign,
-          followingFlightId: INITIAL_FLIGHTS[1].callsign,
+          leadFlightId: selectedSurfaceCallsign ?? INITIAL_FLIGHTS[0].callsign,
+          followingFlightId:
+            fallbackFlights.find((flight) => flight.callsign !== (selectedSurfaceCallsign ?? INITIAL_FLIGHTS[0].callsign))?.callsign
+              ?? fallbackFlights[1].callsign,
         }));
         setRealtimeStatus('INSUFFICIENT LIVE TRAFFIC — SHOWING SIM');
       } catch {
-        setFlights(INITIAL_FLIGHTS);
+        const fallbackFlights = getSurfaceDemoFlights(selectedSurfaceCallsign);
+        setFlights(fallbackFlights);
         setParams((current) => ({
           ...current,
-          leadFlightId: INITIAL_FLIGHTS[0].callsign,
-          followingFlightId: INITIAL_FLIGHTS[1].callsign,
+          leadFlightId: selectedSurfaceCallsign ?? INITIAL_FLIGHTS[0].callsign,
+          followingFlightId:
+            fallbackFlights.find((flight) => flight.callsign !== (selectedSurfaceCallsign ?? INITIAL_FLIGHTS[0].callsign))?.callsign
+              ?? fallbackFlights[1].callsign,
         }));
         setRealtimeStatus('BACKEND UNAVAILABLE — SHOWING SIM');
       }
@@ -189,7 +238,7 @@ export default function App() {
     syncRealtimeAtc();
     const interval = setInterval(syncRealtimeAtc, 5000);
     return () => clearInterval(interval);
-  }, [feedMode, params.airport]);
+  }, [feedMode, params.airport, selectedSurfaceCallsign]);
 
   const speakAtcClearance = useCallback((text: string) => {
     if (!params.voiceEnabled || typeof window === 'undefined' || !('speechSynthesis' in window)) return;
@@ -291,6 +340,39 @@ export default function App() {
     setFlights((prev) => prev.map((f, idx) => ({ ...f, arrivalMinutes: Math.round((2.0 + idx * 2.1) * 10) / 10 })));
   };
 
+  const handleAirportChange = (code: AirportCode) => {
+    setAgentResponse(null);
+    setSelectedSurfaceCallsign(null);
+    setParams((current) => ({
+      ...current,
+      airport: code,
+      leadFlightId: INITIAL_FLIGHTS[0].callsign,
+      followingFlightId: INITIAL_FLIGHTS[1].callsign,
+      crosswindKts: AIRPORTS[code].defaultCrosswind,
+    }));
+  };
+
+  const handleVisualizeTurbulence = (aircraft: SurfaceAircraft) => {
+    const simulationFlights = getSurfaceDemoFlights(aircraft.callsign);
+
+    setSelectedSurfaceCallsign(aircraft.callsign);
+    setFlights(simulationFlights);
+    setFeedMode('SIM');
+    setAgentResponse(null);
+    setParams((current) => ({
+      ...current,
+      leadFlightId: aircraft.callsign,
+      followingFlightId:
+        simulationFlights.find((flight) => flight.callsign !== aircraft.callsign)?.callsign
+          ?? aircraft.callsign,
+    }));
+    setActiveView('DEMO');
+    setActiveScreen('DEMO');
+    setViewMode('3D');
+    setIsFullscreen3D(false);
+    setFocusTrigger((current) => current + 1);
+  };
+
   if (activeView === "ATC_RADAR") {
     return (
       <>
@@ -332,7 +414,12 @@ export default function App() {
         </select>
       </div>
 
-        <KsfoRadar />
+        <KsfoRadar
+          airport={params.airport}
+          metar={liveMetar}
+          onAirportChange={handleAirportChange}
+          onVisualizeTurbulence={handleVisualizeTurbulence}
+        />
       </>
     );
   }
@@ -378,7 +465,12 @@ export default function App() {
         </select>
       </div>
 
-        <KsfoRadar />
+        <KsfoRadar
+          airport={params.airport}
+          metar={liveMetar}
+          onAirportChange={handleAirportChange}
+          onVisualizeTurbulence={handleVisualizeTurbulence}
+        />
       </>
     );
   }
@@ -458,9 +550,8 @@ export default function App() {
           <select
             value={params.airport}
             onChange={(e) => {
-              setAgentResponse(null);
               const code = e.target.value as AirportCode;
-              setParams((p) => ({ ...p, airport: code, crosswindKts: AIRPORTS[code].defaultCrosswind }));
+              handleAirportChange(code);
             }}
             className={`border border-cyan-500/40 text-cyan-400 text-xs font-mono font-bold px-3 py-1.5 rounded-lg outline-none ${lightMode ? 'bg-slate-50' : 'bg-slate-950'}`}
           >
